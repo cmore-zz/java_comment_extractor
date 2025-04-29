@@ -2,8 +2,12 @@ use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
 use std::io::{self, Read};
+
 mod buffered_char_reader;
 use buffered_char_reader::BufferedCharReader;
+
+mod output_writer;
+use output_writer::OutputWriter;
 
 /// A simple Java comment and optional string extractor
 #[derive(Parser)]
@@ -35,15 +39,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut char_reader = BufferedCharReader::new(reader);
 
     let stdout = io::stdout();
-    let mut output = stdout.lock();
+    let mut output_writer = OutputWriter::new(stdout.lock());
 
-    process(&mut char_reader, &mut output, args.preserve_strings)?;
+    process(&mut char_reader, &mut output_writer, args.preserve_strings)?;
     Ok(())
 }
 
 fn process<R: Read, W: io::Write>(
     reader: &mut BufferedCharReader<R>,
-    output: &mut W,
+    output: &mut OutputWriter<W>,
     preserve_strings: bool,
 ) -> io::Result<()> {
     let mut state = State::Normal;
@@ -51,163 +55,169 @@ fn process<R: Read, W: io::Write>(
     while let Some(c) = reader.next_char()? {
         match state {
             State::Normal => match c {
-                '/' => {
-                    if peek_is(reader, '/')? {
-                        let _ = reader.next_char()?;
-                        write_str(output, "  ")?;
+                '/' => match reader.peek_char()? {
+                    Some('/') => {
+                        let _ = reader.next_char();
+                        output.write_str("  ")?;
                         state = State::LineComment;
-                    } else if peek_is(reader, '*')? {
-                        let _ = reader.next_char()?;
-                        write_str(output, "  ")?;
-                        while peek_is(reader, '*')? {
-                            let _ = reader.next_char()?;
-                            write_char(output, ' ')?;
+                    }
+                    Some('*') => {
+                        let _ = reader.next_char();
+                        output.write_str("  ")?;
+                        while let Some('*') = reader.peek_char()? {
+                            let _ = reader.next_char();
+                            output.write_char(' ')?;
                         }
                         state = State::BlockComment;
-                        if maybe_close_block_comment(reader) {
+                        if maybe_close_block_comment(reader)? {
                             state = State::Normal;
                         }
-                    } else {
-                        write_char(output, ' ')?;
                     }
-                }
+                    _ => {
+                        output.write_char(' ')?;
+                    }
+                },
                 '"' => {
-                    if peek_is(reader, '"')? {
-                        let _ = reader.next_char()?;
-                        if peek_is(reader, '"')? {
-                            let _ = reader.next_char()?;
-                            write_str(output, "   ")?;
-                            state = State::TextBlockLiteral;
-                            continue;
-                        } else {
-                            write_str(output, "  ")?;
-                            state = State::Normal;
-                            continue;
+                    if let Some(next1) = reader.peek_char()? {
+                        if next1 == '"' {
+                            let _ = reader.next_char();
+                            if let Some(next2) = reader.peek_char()? {
+                                if next2 == '"' {
+                                    let _ = reader.next_char();
+                                    output.write_n_spaces(3)?;
+                                    state = State::TextBlockLiteral;
+                                    continue;
+                                } else {
+                                    output.write_n_spaces(2)?;
+                                    state = State::Normal;
+                                    continue;
+                                }
+                            } else {
+                                output.write_n_spaces(2)?;
+                                state = State::Normal;
+                                continue;
+                            }
                         }
                     }
-                    write_char(output, ' ')?;
+                    output.write_char(' ')?;
                     state = State::StringLiteral;
                 }
                 '\'' => {
-                    write_char(output, ' ')?;
+                    output.write_char(' ')?;
                     state = State::CharLiteral;
                 }
-                '\n' => {
-                    write_char(output, '\n')?;
-                }
-                _ => {
-                    write_char(output, ' ')?;
-                }
+                '\n' => output.write_char('\n')?,
+                _ => output.write_char(' ')?,
             },
             State::LineComment => match c {
                 '\n' => {
-                    write_char(output, '\n')?;
+                    output.write_char('\n')?;
                     state = State::Normal;
                 }
-                _ => write_char(output, c)?,
+                _ => output.write_char(c)?,
             },
             State::BlockComment => match c {
                 '*' => {
-                    if peek_is(reader, '/')? {
-                        let _ = reader.next_char()?;
-                        write_str(output, "  ")?;
+                    if let Some('/') = reader.peek_char()? {
+                        let _ = reader.next_char();
+                        output.write_str("  ")?;
                         state = State::Normal;
                         continue;
                     } else {
-                        write_char(output, '*')?;
+                        output.write_char('*')?;
                     }
                 }
                 '\n' => {
-                    write_char(output, '\n')?;
-                    if maybe_close_block_comment(reader) {
+                    output.write_char('\n')?;
+                    if maybe_close_block_comment(reader)? {
                         state = State::Normal;
                         continue;
                     }
                 }
-                _ => write_char(output, c)?,
+                _ => output.write_char(c)?,
             },
             State::StringLiteral => match c {
                 '\\' => {
                     if let Some(escaped) = reader.next_char()? {
                         if preserve_strings {
-                            write_char(output, escaped)?;
+                            output.write_char(escaped)?;
                         } else {
-                            write_char(output, ' ')?;
+                            output.write_char(' ')?;
                         }
                     }
                 }
                 '"' => {
-                    write_char(output, ' ')?;
+                    output.write_char(' ')?;
                     state = State::Normal;
                     continue;
                 }
                 '\n' => {
-                    write_char(output, '\n')?;
+                    output.write_char('\n')?;
                     state = State::Normal;
                 }
                 _ => {
                     if preserve_strings {
-                        write_char(output, c)?;
+                        output.write_char(c)?;
                     } else {
-                        write_char(output, ' ')?;
+                        output.write_char(' ')?;
                     }
                 }
             },
             State::TextBlockLiteral => match c {
                 '"' => {
-                    if peek_is(reader, '"')? {
-                        let _ = reader.next_char()?;
-                        if peek_is(reader, '"')? {
-                            let _ = reader.next_char()?;
-                            write_str(output, "   ")?;
-                            state = State::Normal;
-                            continue;
+                    if let Some(next1) = reader.peek_char()? {
+                        if next1 == '"' {
+                            let _ = reader.next_char();
+                            if let Some(next2) = reader.peek_char()? {
+                                if next2 == '"' {
+                                    let _ = reader.next_char();
+                                    output.write_n_spaces(3)?;
+                                    state = State::Normal;
+                                    continue;
+                                }
+                            }
                         }
                     }
                     if preserve_strings {
-                        write_char(output, '"')?;
+                        output.write_char('"')?;
                     } else {
-                        write_char(output, ' ')?;
+                        output.write_char(' ')?;
                     }
                 }
                 '\\' => {
                     if let Some(escaped) = reader.next_char()? {
                         if preserve_strings {
-                            write_char(output, escaped)?;
+                            output.write_char(escaped)?;
                         } else {
-                            write_char(output, ' ')?;
+                            output.write_char(' ')?;
                         }
                     }
                 }
-                '\n' => {
-                    write_char(output, '\n')?;
-                }
+                '\n' => output.write_char('\n')?,
                 _ => {
                     if preserve_strings {
-                        write_char(output, c)?;
+                        output.write_char(c)?;
                     } else {
-                        write_char(output, ' ')?;
+                        output.write_char(' ')?;
                     }
                 }
             },
             State::CharLiteral => match c {
                 '\\' => {
-                    write_char(output, ' ')?;
+                    output.write_char(' ')?;
                     if let Some(_) = reader.next_char()? {
-                        write_char(output, ' ')?;
+                        output.write_char(' ')?;
                     }
                 }
                 '\'' => {
-                    write_char(output, ' ')?;
+                    output.write_char(' ')?;
                     state = State::Normal;
                 }
                 '\n' => {
-                    write_char(output, '\n')?;
+                    output.write_char('\n')?;
                     state = State::Normal;
                 }
-                _ => {
-                    write_char(output, ' ')?;
-                }
+                _ => output.write_char(' ')?,
             },
         }
     }
@@ -215,36 +225,26 @@ fn process<R: Read, W: io::Write>(
     Ok(())
 }
 
-/// Helper function to check and handle block comment closure after a newline
-fn maybe_close_block_comment<R: Read>(reader: &mut BufferedCharReader<R>) -> bool {
-    while matches!(reader.peek_char(), Ok(Some(' ' | '\t'))) {
-        let _ = reader.next_char();
-    }
-    if matches!(reader.peek_char(), Ok(Some('*'))) {
-        let _ = reader.next_char();
-        if matches!(reader.peek_char(), Ok(Some('/'))) {
+fn maybe_close_block_comment<R: Read>(reader: &mut BufferedCharReader<R>) -> io::Result<bool> {
+    while let Some(c) = reader.peek_char()? {
+        if c == ' ' || c == '\t' {
             let _ = reader.next_char();
-            return true;
-        } else if matches!(reader.peek_char(), Ok(Some(' '))) {
+        } else {
+            break;
+        }
+    }
+    if let Some('*') = reader.peek_char()? {
+        let _ = reader.next_char();
+        if let Some('/') = reader.peek_char()? {
+            let _ = reader.next_char();
+            return Ok(true);
+        } else if let Some(' ') = reader.peek_char()? {
             let _ = reader.next_char();
         }
     }
-    false
+    Ok(false)
 }
 
-fn write_char<W: io::Write>(out: &mut W, c: char) -> io::Result<()> {
-    let mut temp = [0u8; 4];
-    let encoded = c.encode_utf8(&mut temp);
-    out.write_all(encoded.as_bytes())
-}
-
-fn write_str<W: io::Write>(out: &mut W, s: &str) -> io::Result<()> {
-    out.write_all(s.as_bytes())
-}
-
-fn peek_is<R: Read>(reader: &mut BufferedCharReader<R>, expected: char) -> io::Result<bool> {
-    Ok(matches!(reader.peek_char()?, Some(c) if c == expected))
-}
 
 
 
